@@ -110,27 +110,36 @@ private fun NoteApp() {
 
     fun scheduleAutoBackup() {
         if (connectedEmail.isBlank() || driveAccessToken.isBlank()) return
+
         autoBackupJob?.cancel()
         autoBackupJob = scope.launch {
-            delay(1500)
+            driveBusy = true
+            driveStatus = "Syncing to Google Drive"
+
             try {
+                delay(1500)
+
                 val email = DriveBackupManager.getConnectedEmail(driveAccessToken)
                 if (!email.equals(connectedEmail, ignoreCase = true)) {
                     driveStatus = "Auto backup paused: Google account mismatch. Reconnect Drive."
                     return@launch
                 }
+
                 val result = DriveBackupManager.backup(context, driveAccessToken)
                 result.modifiedTime?.let {
-                    profilePrefs.edit().putString(
-                        "last_drive_sync_modified_time", it
-                    ).apply()
+                    profilePrefs.edit()
+                        .putString("last_drive_sync_modified_time", it)
+                        .apply()
                 }
                 driveStatus = "Auto backup complete: ${result.noteCount} notes/tasks saved."
             } catch (e: Exception) {
-                driveStatus = "Auto backup failed. Open Profile and use Backup Now to reconnect."
+                driveStatus = "Auto sync failed: ${e.message ?: "Check your Google Drive connection."}"
+            } finally {
+                driveBusy = false
             }
         }
     }
+
     val activity = context as ComponentActivity
 
     val performAuthorizedAction: (String, String) -> Unit = { action, token ->
@@ -401,6 +410,7 @@ private fun NoteApp() {
 
     var tab by remember { mutableIntStateOf(0) }
     var query by remember { mutableStateOf("") }
+    var searchVisible by remember { mutableStateOf(false) }
     var editorOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Note?>(null) }
 
@@ -525,20 +535,63 @@ private fun NoteApp() {
                         )
                     }
                     Box(
-                        Modifier.size(42.dp)
-                            .background(Color(0xFFE8EBDD), CircleShape),
+                        modifier = Modifier
+                            .size(42.dp)
+                            .background(Color(0xFFE8EBDD), CircleShape)
+                            .clickable {
+                                searchVisible = !searchVisible
+                                if (!searchVisible) query = ""
+                            },
                         contentAlignment = Alignment.Center
                     ) {
-                        if (tab == 0) {
-                            Icon(Icons.Outlined.Description, null, tint = Accent)
+                        Icon(
+                            Icons.Outlined.Search,
+                            contentDescription = if (searchVisible) "Close search" else "Search",
+                            tint = Accent
+                        )
+                    }
+                }
+
+                if (driveBusy && driveStatus.contains("Syncing", ignoreCase = true)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 12.dp)
+                            .background(Color.White, RoundedCornerShape(12.dp))
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (driveStatus.contains("Syncing", ignoreCase = true)) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = Accent
+                            )
+                            Spacer(Modifier.width(10.dp))
                         } else {
-                            Icon(Icons.Outlined.Checklist, null, tint = Accent)
+                            Icon(
+                                imageVector = if (
+                                    driveStatus.contains("complete", ignoreCase = true) ||
+                                    driveStatus.contains("saved", ignoreCase = true)
+                                ) Icons.Outlined.Description
+                                else Icons.Outlined.Description,
+                                contentDescription = null,
+                                tint = Accent,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
                         }
+                        Text(
+                            text = driveStatus,
+                            color = Muted,
+                            fontSize = 12.sp
+                        )
                     }
                 }
 
                 Spacer(Modifier.height(22.dp))
 
+                if (searchVisible) {
                 Row(
                     Modifier.fillMaxWidth()
                         .background(Color(0xFFF0EFE9), RoundedCornerShape(16.dp))
@@ -568,6 +621,7 @@ private fun NoteApp() {
                             }
                         }
                     )
+                }
                 }
 
                 Spacer(Modifier.height(20.dp))
@@ -1026,6 +1080,7 @@ private fun ProfileScreen(
         if (showClearDataConfirm) {
             AlertDialog(
                 onDismissRequest = { showClearDataConfirm = false },
+                containerColor = Color.White,
                 title = { Text("Clear all data?") },
                 text = {
                     Text(
