@@ -1,6 +1,14 @@
 package com.note.app
 
 import android.Manifest
+import com.note.app.backup.DriveBackupManager
+import com.google.android.gms.common.api.Scope
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import android.app.Activity
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.os.Build
@@ -24,6 +32,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Alarm
 import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.Search
@@ -44,8 +53,9 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-
 private val Canvas = Color(0xFFFAF9F6)
 private val Ink = Color(0xFF292A25)
 private val Muted = Color(0xFF85867D)
@@ -75,6 +85,319 @@ private fun NoteApp() {
     val dao = remember { NoteDatabase.get(context).noteDao() }
     val scope = rememberCoroutineScope()
     val notes by dao.observeAll().collectAsState(initial = emptyList())
+    val profilePrefs = remember {
+        context.getSharedPreferences("note_profile", android.content.Context.MODE_PRIVATE)
+    }
+    var profileName by remember {
+        mutableStateOf(profilePrefs.getString("name", "").orEmpty())
+    }
+    var profileMobile by remember {
+        mutableStateOf(profilePrefs.getString("mobile", "").orEmpty())
+    }
+
+    var connectedEmail by remember {
+        mutableStateOf(profilePrefs.getString("google_email", "").orEmpty())
+    }
+    var driveStatus by remember { mutableStateOf("") }
+    var driveBusy by remember { mutableStateOf(false) }
+    var pendingDriveAction by remember { mutableStateOf("connect") }
+    var driveAccessToken by remember { mutableStateOf("") }
+    var showChangeBackupWarning by remember { mutableStateOf(false) }
+    var pendingChangeToken by remember { mutableStateOf("") }
+    var pendingChangeEmail by remember { mutableStateOf("") }
+    var autoBackupJob by remember { mutableStateOf<Job?>(null) }
+    var driveStartupComplete by remember { mutableStateOf(false) }
+
+    fun scheduleAutoBackup() {
+        if (connectedEmail.isBlank() || driveAccessToken.isBlank()) return
+        autoBackupJob?.cancel()
+        autoBackupJob = scope.launch {
+            delay(1500)
+            try {
+                val email = DriveBackupManager.getConnectedEmail(driveAccessToken)
+                if (!email.equals(connectedEmail, ignoreCase = true)) {
+                    driveStatus = "Auto backup paused: Google account mismatch. Reconnect Drive."
+                    return@launch
+                }
+                val result = DriveBackupManager.backup(context, driveAccessToken)
+                result.modifiedTime?.let {
+                    profilePrefs.edit().putString(
+                        "last_drive_sync_modified_time", it
+                    ).apply()
+                }
+                driveStatus = "Auto backup complete: ${result.noteCount} notes/tasks saved."
+            } catch (e: Exception) {
+                driveStatus = "Auto backup failed. Open Profile and use Backup Now to reconnect."
+            }
+        }
+    }
+    val activity = context as ComponentActivity
+
+    val performAuthorizedAction: (String, String) -> Unit = { action, token ->
+        scope.launch {
+            try {
+                driveBusy = true
+                when (action) {
+                    "startup" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+                        if (connectedEmail.isNotBlank() &&
+                            !connectedEmail.equals(email, ignoreCase = true)
+                        ) {
+                            error(
+                                "The authorized Gmail differs from the saved Drive account. " +
+                                "Retry and authorize the intended Google account."
+                            )
+                        }
+
+                        connectedEmail = email
+                        profilePrefs.edit().putString("google_email", email).apply()
+
+                        val remoteModified =
+                            DriveBackupManager.getLatestBackupModifiedTime(token)
+                        val lastRestored = profilePrefs.getString(
+                            "last_drive_sync_modified_time", ""
+                        ).orEmpty()
+
+                        if (remoteModified.isNullOrBlank()) {
+                            driveStatus = "No Drive backup found. Starting fresh."
+                        } else if (remoteModified != lastRestored) {
+                            val result = DriveBackupManager.restore(context, token)
+                            profileName = profilePrefs.getString("name", "").orEmpty()
+                            profileMobile = profilePrefs.getString("mobile", "").orEmpty()
+                            profilePrefs.edit().putString(
+                                "last_drive_sync_modified_time",
+                                result.modifiedTime ?: remoteModified
+                            ).apply()
+                            driveStatus =
+                                "Updated Drive backup restored: ${result.noteCount} notes/tasks."
+                        } else {
+                            driveStatus = "Google Drive is up to date."
+                        }
+
+                        driveStartupComplete = true
+                    }
+                    "change" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+                        if (email.equals(connectedEmail, ignoreCase = true)) {
+                            driveStatus = "This Gmail is already connected. Choose another account."
+                        } else {
+                            val remote = DriveBackupManager.getLatestBackupModifiedTime(token)
+                            if (!remote.isNullOrBlank()) {
+                                pendingChangeToken = token
+                                pendingChangeEmail = email
+                                showChangeBackupWarning = true
+                                driveStatus = "A backup exists in $email. Confirm before syncing."
+                            } else {
+                                val result = DriveBackupManager.backup(context, token)
+                                connectedEmail = email
+                                profilePrefs.edit().putString("google_email", email).apply()
+                                result.modifiedTime?.let {
+                                    profilePrefs.edit().putString("last_drive_sync_modified_time", it).apply()
+                                }
+                                driveAccessToken = token
+                                driveStatus = "Changed to $email. Synced ${result.noteCount} local notes/tasks."
+                            }
+                        }
+                    }
+                    "change-confirmed" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+                        require(email.equals(pendingChangeEmail, ignoreCase = true)) {
+                            "Selected Gmail changed. Please retry Change Account."
+                        }
+                        val result = DriveBackupManager.backup(context, token)
+                        connectedEmail = email
+                        profilePrefs.edit().putString("google_email", email).apply()
+                        result.modifiedTime?.let {
+                            profilePrefs.edit().putString("last_drive_sync_modified_time", it).apply()
+                        }
+                        driveAccessToken = token
+                        pendingChangeToken = ""
+                        pendingChangeEmail = ""
+                        showChangeBackupWarning = false
+                        driveStatus = "Changed to $email. Synced ${result.noteCount} local notes/tasks. Existing backups were preserved."
+                    }
+                    "connect" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+
+                        if (connectedEmail.isNotBlank() &&
+                            !connectedEmail.equals(email, ignoreCase = true)
+                        ) {
+                            error("A different Gmail was selected. Use Change Account to switch accounts safely.")
+                        }
+
+                        connectedEmail = email
+                        profilePrefs.edit().putString("google_email", email).apply()
+
+                        val remoteModified =
+                            DriveBackupManager.getLatestBackupModifiedTime(token)
+
+                        if (!remoteModified.isNullOrBlank()) {
+                            val result = DriveBackupManager.restore(context, token)
+
+                            profileName = profilePrefs.getString("name", "").orEmpty()
+                            profileMobile = profilePrefs.getString("mobile", "").orEmpty()
+
+                            profilePrefs.edit().putString(
+                                "last_drive_sync_modified_time",
+                                result.modifiedTime ?: remoteModified
+                            ).apply()
+
+                            driveStatus =
+                                "Drive backup restored: ${result.noteCount} notes/tasks."
+                        } else {
+                            driveStatus =
+                                "No Drive backup found. Your local notes/tasks were kept."
+                        }
+
+                        driveAccessToken = token
+                        driveStartupComplete = true
+                    }
+                    "backup" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+                        if (connectedEmail.isNotBlank() &&
+                            !connectedEmail.equals(email, ignoreCase = true)
+                        ) {
+                            error("The authorized Gmail differs from the connected account. Connect the intended account first.")
+                        }
+                        connectedEmail = email
+                        profilePrefs.edit().putString("google_email", email).apply()
+                        val result = DriveBackupManager.backup(context, token)
+                        result.modifiedTime?.let {
+                            profilePrefs.edit().putString(
+                                "last_drive_sync_modified_time", it
+                            ).apply()
+                        }
+                        driveStatus = "Backup complete: \${result.noteCount} notes/tasks saved."
+                    }
+                    "clear-data" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+                        if (
+                            connectedEmail.isBlank() ||
+                            !connectedEmail.equals(email, ignoreCase = true)
+                        ) {
+                            error("The authorized Gmail does not match the connected account. No local data was deleted.")
+                        }
+
+                        // Prevent a queued auto-backup from recreating deleted data.
+                        autoBackupJob?.cancel()
+                        autoBackupJob = null
+
+                        // Delete Drive backups first. If this fails, keep local data intact.
+                        val deletedBackups = DriveBackupManager.deleteAllBackups(token)
+
+                        NoteDatabase.get(context).noteDao().clearAll()
+
+                        profilePrefs.edit()
+                            .remove("last_drive_sync_modified_time")
+                            .apply()
+
+                        driveAccessToken = token
+                        driveStartupComplete = true
+                        driveStatus =
+                            "Clear complete: local notes/tasks cleared and $deletedBackups Drive backup(s) deleted. Profile and Google account were preserved."
+                    }
+                    "restore" -> {
+                        val email = DriveBackupManager.getConnectedEmail(token)
+                        if (connectedEmail.isNotBlank() &&
+                            !connectedEmail.equals(email, ignoreCase = true)
+                        ) {
+                            error("The authorized Gmail differs from the connected account. Connect the intended account first.")
+                        }
+                        connectedEmail = email
+                        profilePrefs.edit().putString("google_email", email).apply()
+                        val result = DriveBackupManager.restore(context, token)
+                        profileName = profilePrefs.getString("name", "").orEmpty()
+                        profileMobile = profilePrefs.getString("mobile", "").orEmpty()
+                        result.modifiedTime?.let {
+                            profilePrefs.edit().putString(
+                                "last_drive_sync_modified_time", it
+                            ).apply()
+                        }
+                        driveStatus = "Restore complete: \${result.noteCount} notes/tasks restored."
+                    }
+                }
+            } catch (e: Exception) {
+                driveStatus = e.message ?: "Google Drive operation failed."
+            } finally {
+                driveBusy = false
+            }
+        }
+    }
+
+    val authorizationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            try {
+                val authResult = Identity.getAuthorizationClient(activity)
+                    .getAuthorizationResultFromIntent(result.data)
+                val token = authResult.accessToken
+                if (!token.isNullOrBlank()) {
+                    driveAccessToken = token
+                    performAuthorizedAction(pendingDriveAction, token)
+                } else {
+                    driveBusy = false
+                    driveStatus = "Google authorization did not return an access token."
+                }
+            } catch (e: Exception) {
+                driveBusy = false
+                driveStatus = e.message ?: "Google authorization failed."
+            }
+        } else {
+            driveBusy = false
+            driveStatus = "Google account authorization was cancelled. Connect to continue."
+        }
+    }
+
+    val requestDriveAuthorization: (String) -> Unit = { action ->
+        pendingDriveAction = action
+        driveBusy = true
+        driveStatus = "Waiting for Google authorization..."
+        val request = AuthorizationRequest.builder()
+            .setRequestedScopes(
+                listOf(
+                    Scope("https://www.googleapis.com/auth/drive.appdata"),
+                    Scope("https://www.googleapis.com/auth/userinfo.email")
+                )
+            )
+            .setPrompt(
+                if (action == "change") AuthorizationRequest.Prompt.SELECT_ACCOUNT
+                else AuthorizationRequest.Prompt.NOT_SET
+            )
+            .build()
+
+        Identity.getAuthorizationClient(activity).authorize(request)
+            .addOnSuccessListener { authResult ->
+                if (authResult.hasResolution()) {
+                    val pendingIntent = authResult.pendingIntent
+                    if (pendingIntent != null) {
+                        authorizationLauncher.launch(
+                            IntentSenderRequest.Builder(pendingIntent.intentSender).build()
+                        )
+                    } else {
+                        driveBusy = false
+                        driveStatus = "Google authorization needs another attempt."
+                    }
+                } else {
+                    val token = authResult.accessToken
+                    if (!token.isNullOrBlank()) {
+                        driveAccessToken = token
+                        performAuthorizedAction(action, token)
+                    } else {
+                        driveBusy = false
+                        driveStatus = "Google authorization did not return an access token."
+                    }
+                }
+            }
+            .addOnFailureListener { error ->
+                driveBusy = false
+                driveStatus = error.message ?: "Could not connect to Google."
+            }
+    }
+
+    LaunchedEffect(Unit) {
+        requestDriveAuthorization("startup")
+    }
 
     var tab by remember { mutableIntStateOf(0) }
     var query by remember { mutableStateOf("") }
@@ -95,7 +418,7 @@ private fun NoteApp() {
         Scaffold(
             containerColor = Canvas,
             bottomBar = {
-                NavigationBar(
+                if (driveStartupComplete) NavigationBar(
                     containerColor = Color.White,
                     contentColor = Accent,
                     tonalElevation = 8.dp
@@ -112,10 +435,16 @@ private fun NoteApp() {
                         icon = { Icon(Icons.Outlined.Checklist, null) },
                         label = { Text("To-do", fontWeight = FontWeight.Medium) }
                     )
+                    NavigationBarItem(
+                        selected = tab == 2,
+                        onClick = { tab = 2; query = ""; editorOpen = false },
+                        icon = { Icon(Icons.Outlined.Person, null) },
+                        label = { Text("Profile", fontWeight = FontWeight.Medium) }
+                    )
                 }
             },
             floatingActionButton = {
-                ExtendedFloatingActionButton(
+                if (driveStartupComplete && tab != 2) ExtendedFloatingActionButton(
                     onClick = {
                         editing = null
                         editorOpen = true
@@ -128,11 +457,52 @@ private fun NoteApp() {
                 )
             }
         ) { padding ->
+            if (!driveStartupComplete) {
+                DriveStartupScreen(
+                    busy = driveBusy,
+                    status = driveStatus,
+                    onConnect = { requestDriveAuthorization("startup") },
+                    modifier = Modifier.padding(padding)
+                )
+            } else if (tab == 2) {
+                ProfileScreen(
+                    name = profileName,
+                    mobile = profileMobile,
+                    onNameChange = { profileName = it },
+                    onMobileChange = { profileMobile = it },
+                    connectedEmail = connectedEmail,
+                    driveStatus = driveStatus,
+                    driveBusy = driveBusy,
+                    onConnectGoogle = { requestDriveAuthorization("connect") },
+                    onChangeGoogle = { requestDriveAuthorization("change") },
+                    showChangeBackupWarning = showChangeBackupWarning,
+                    changeBackupEmail = pendingChangeEmail,
+                    onConfirmChangeAccount = {
+                        showChangeBackupWarning = false
+                        performAuthorizedAction("change-confirmed", pendingChangeToken)
+                    },
+                    onCancelChangeAccount = {
+                        showChangeBackupWarning = false
+                        pendingChangeToken = ""
+                        pendingChangeEmail = ""
+                        driveStatus = "Account change cancelled. No data was uploaded or deleted."
+                    },
+                    onBackupNow = { requestDriveAuthorization("backup") },
+                    onRestore = { requestDriveAuthorization("restore") },
+                    onClearData = { requestDriveAuthorization("clear-data") },
+                    onSave = {
+                        profilePrefs.edit()
+                            .putString("name", profileName.trim())
+                            .putString("mobile", profileMobile.trim())
+                            .apply()
+                    }
+                )
+            } else {
             Column(
                 Modifier.fillMaxSize()
                     .background(Canvas)
                     .padding(padding)
-                    .padding(start = 20.dp, end = 20.dp, top = 22.dp)
+                    .padding(start = 20.dp, end = 20.dp, top = 8.dp)
             ) {
                 Row(
                     Modifier.fillMaxWidth(),
@@ -140,7 +510,7 @@ private fun NoteApp() {
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            if (tab == 0) "Your notes" else "Your tasks",
+                            if (tab == 0) "Notes" else "Tasks",
                             fontSize = 29.sp,
                             fontWeight = FontWeight.Bold,
                             color = Ink,
@@ -266,6 +636,7 @@ private fun NoteApp() {
                                             pinned = !note.pinned,
                                             updatedAt = System.currentTimeMillis()
                                         ))
+                                        scheduleAutoBackup()
                                     }
                                 }
                             )
@@ -286,6 +657,7 @@ private fun NoteApp() {
                                             isCompleted = !task.isCompleted,
                                             updatedAt = System.currentTimeMillis()
                                         ))
+                                        scheduleAutoBackup()
                                     }
                                 },
                                 onClick = { editing = task; editorOpen = true }
@@ -294,9 +666,10 @@ private fun NoteApp() {
                     }
                 }
             }
+            }
         }
 
-        if (editorOpen) {
+        if (editorOpen && tab != 2) {
             NoteEditor(
                 initial = editing,
                 todoMode = tab == 1,
@@ -315,17 +688,65 @@ private fun NoteApp() {
                                 ReminderScheduler.schedule(context, result)
                             }
                         }
+                            scheduleAutoBackup()
                     }
                     editorOpen = false
                     editing = null
                 },
                 onDelete = { item ->
                     ReminderScheduler.cancel(context, item.id)
-                    scope.launch { dao.delete(item) }
+                    scope.launch {
+                        dao.delete(item)
+                        scheduleAutoBackup()
+                    }
                     editorOpen = false
                     editing = null
                 }
             )
+        }
+    }
+}
+
+@Composable
+private fun DriveStartupScreen(
+    busy: Boolean,
+    status: String,
+    onConnect: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier.fillMaxSize().padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(
+                "Connect Google Drive",
+                fontSize = 25.sp,
+                fontWeight = FontWeight.Bold,
+                color = Ink
+            )
+            Text(
+                "Connect your Google account to check for your latest notes and tasks backup.",
+                fontSize = 14.sp,
+                color = Muted
+            )
+            if (busy) {
+                CircularProgressIndicator(color = Accent)
+            } else {
+                Button(
+                    onClick = onConnect,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Text("Connect / Retry")
+                }
+            }
+            if (status.isNotBlank()) {
+                Text(status, color = Muted, fontSize = 12.sp)
+            }
         }
     }
 }
@@ -424,6 +845,240 @@ private fun TaskCard(
                 }
             }
         }
+    }
+}
+
+
+
+@Composable
+private fun ProfileScreen(
+    name: String,
+    mobile: String,
+    onNameChange: (String) -> Unit,
+    onMobileChange: (String) -> Unit,
+    connectedEmail: String,
+    driveStatus: String,
+    driveBusy: Boolean,
+    onConnectGoogle: () -> Unit,
+    onChangeGoogle: () -> Unit,
+    showChangeBackupWarning: Boolean,
+    changeBackupEmail: String,
+    onConfirmChangeAccount: () -> Unit,
+    onCancelChangeAccount: () -> Unit,
+    onBackupNow: () -> Unit,
+    onRestore: () -> Unit,
+    onClearData: () -> Unit,
+    onSave: () -> Unit
+) {
+    var showRestoreConfirm by remember { mutableStateOf(false) }
+    var showClearDataConfirm by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Canvas)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 52.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(
+            text = "Profile",
+            fontSize = 29.sp,
+            fontWeight = FontWeight.Bold,
+            color = Ink
+        )
+        Text(
+            text = "Your personal details",
+            fontSize = 14.sp,
+            color = Muted
+        )
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            color = Color.White,
+            tonalElevation = 1.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = onNameChange,
+                    label = { Text("Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp)
+                )
+                OutlinedTextField(
+                    value = mobile,
+                    onValueChange = onMobileChange,
+                    label = { Text("Mobile number") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp)
+                )
+                Button(
+                    onClick = onSave,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Text("Save profile")
+                }
+            }
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            color = Color.White,
+            tonalElevation = 1.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("Google Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (connectedEmail.isBlank()) "Not connected"
+                    else connectedEmail,
+                    color = if (connectedEmail.isBlank()) Muted else Accent,
+                    fontSize = 14.sp
+                )
+
+                if (connectedEmail.isBlank()) {
+                    Button(
+                        onClick = onConnectGoogle,
+                        enabled = !driveBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text(if (driveBusy) "Connecting..." else "Connect Google Account")
+                    }
+                } else {
+                    Button(
+                        onClick = onBackupNow,
+                        enabled = !driveBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text("Backup Now")
+                    }
+                    OutlinedButton(
+                        onClick = { showRestoreConfirm = true },
+                        enabled = !driveBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text("Restore Backup")
+                    }
+                    TextButton(
+                        onClick = onChangeGoogle,
+                        enabled = !driveBusy,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Change Account")
+                    }
+
+                    OutlinedButton(
+                        onClick = { showClearDataConfirm = true },
+                        enabled = !driveBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text("Clear Data", color = Color.Red)
+                    }
+                }
+
+                if (driveBusy) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                if (driveStatus.isNotBlank()) {
+                    Text(driveStatus, color = Muted, fontSize = 12.sp)
+                }
+            }
+        }
+
+        if (showChangeBackupWarning) {
+            AlertDialog(
+                onDismissRequest = onCancelChangeAccount,
+                containerColor = Color.White,
+                title = { Text("Backup already exists") },
+                text = {
+                    Text(
+                        "A backup already exists in $changeBackupEmail. Continuing uploads the notes and tasks currently on this device as a new backup. Existing backup files will be kept. Nothing will be restored to this device."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = onConfirmChangeAccount) {
+                        Text("Continue & Sync")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = onCancelChangeAccount) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        if (showClearDataConfirm) {
+            AlertDialog(
+                onDismissRequest = { showClearDataConfirm = false },
+                title = { Text("Clear all data?") },
+                text = {
+                    Text(
+                        "This permanently deletes all local notes/tasks and all Note backup files from the connected Google Drive account. " +
+                            "Your profile name, mobile number and connected Gmail will remain. This action cannot be undone."
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            showClearDataConfirm = false
+                            onClearData()
+                        }
+                    ) {
+                        Text("Delete Everything", color = Color.Red)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showClearDataConfirm = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        if (showRestoreConfirm) {
+            AlertDialog(
+                onDismissRequest = { showRestoreConfirm = false },
+                title = { Text("Restore backup?") },
+                text = {
+                    Text("Restoring replaces the notes and tasks currently on this device with the latest backup from Google Drive. Continue only if you want to replace local data.")
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            showRestoreConfirm = false
+                            onRestore()
+                        }
+                    ) { Text("Restore") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRestoreConfirm = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        Text(
+            text = "Your details are saved on this device.",
+            fontSize = 12.sp,
+            color = Muted
+        )
     }
 }
 

@@ -1,0 +1,309 @@
+package com.note.app.backup
+
+import android.content.Context
+import com.note.app.data.Note
+import com.note.app.data.NoteDatabase
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import androidx.room.withTransaction
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * Stores a complete Note database snapshot in the app-specific
+ * Google Drive appDataFolder. The caller must obtain a fresh,
+ * authorized OAuth access token before invoking these methods.
+ */
+object DriveBackupManager {
+    private const val BACKUP_NAME = "note_backup.json"
+    private const val DRIVE_FILES =
+        "https://www.googleapis.com/drive/v3/files"
+    private const val UPLOAD_FILES =
+        "https://www.googleapis.com/upload/drive/v3/files"
+    private const val MAX_BACKUP_BYTES = 20 * 1024 * 1024
+
+    data class BackupInfo(
+        val modifiedTime: String?,
+        val noteCount: Int
+    )
+
+    private fun request(
+        url: String,
+        token: String,
+        method: String = "GET",
+        body: ByteArray? = null,
+        contentType: String? = null
+    ): Pair<Int, ByteArray> {
+        val connection = (URL(url).openConnection() as HttpURLConnection)
+        try {
+            connection.requestMethod = method
+            connection.connectTimeout = 20000
+            connection.readTimeout = 30000
+            connection.setRequestProperty(
+                "Authorization", "Bearer $token"
+            )
+            connection.setRequestProperty("Accept", "application/json")
+            if (body != null) {
+                connection.doOutput = true
+                connection.setRequestProperty(
+                    "Content-Type",
+                    contentType ?: "application/json; charset=utf-8"
+                )
+                connection.outputStream.use { it.write(body) }
+            }
+            val code = connection.responseCode
+            val stream = if (code in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            }
+            val bytes = stream?.use { it.readBytes() } ?: byteArrayOf()
+            if (bytes.size > MAX_BACKUP_BYTES) {
+                error("Drive response is unexpectedly large.")
+            }
+            return code to bytes
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun requireSuccess(result: Pair<Int, ByteArray>): ByteArray {
+        if (result.first !in 200..299) {
+            val detail = result.second.toString(Charsets.UTF_8)
+                .take(500)
+            error("Google Drive request failed (${result.first}): $detail")
+        }
+        return result.second
+    }
+
+    private fun noteToJson(note: Note) = JSONObject().apply {
+        put("id", note.id)
+        put("title", note.title)
+        put("content", note.content)
+        put("pinned", note.pinned)
+        put("color", note.color)
+        put("reminderAt", note.reminderAt ?: JSONObject.NULL)
+        put("repeat", note.repeat)
+        put("updatedAt", note.updatedAt)
+        put("isTodo", note.isTodo)
+        put("isCompleted", note.isCompleted)
+    }
+
+    private fun jsonToNote(o: JSONObject): Note {
+        val id = o.getLong("id")
+        require(id > 0L) { "Backup contains an invalid note ID." }
+
+        val reminder = if (o.isNull("reminderAt")) {
+            null
+        } else {
+            o.getLong("reminderAt")
+        }
+
+        return Note(
+            id = id,
+            title = o.getString("title"),
+            content = o.getString("content"),
+            pinned = o.getBoolean("pinned"),
+            color = o.getInt("color"),
+            reminderAt = reminder,
+            repeat = o.getString("repeat"),
+            updatedAt = o.getLong("updatedAt"),
+            isTodo = o.getBoolean("isTodo"),
+            isCompleted = o.getBoolean("isCompleted")
+        )
+    }
+
+    private fun makeSnapshot(
+        notes: List<Note>,
+        profile: android.content.SharedPreferences
+    ): ByteArray {
+        val array = JSONArray()
+        notes.forEach { array.put(noteToJson(it)) }
+
+        return JSONObject().apply {
+            put("formatVersion", 1)
+            put("app", "Note")
+            put("createdAt", System.currentTimeMillis())
+            put("profile", JSONObject().apply {
+                put("name", profile.getString("name", "").orEmpty())
+                put("mobile", profile.getString("mobile", "").orEmpty())
+            })
+            put("notes", array)
+        }.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    private fun listBackups(token: String): JSONArray {
+        val q = java.net.URLEncoder.encode(
+            "name='$BACKUP_NAME' and 'appDataFolder' in parents and trashed=false",
+            "UTF-8"
+        )
+        val url = "$DRIVE_FILES?spaces=appDataFolder&q=$q" +
+            "&pageSize=100&orderBy=modifiedTime%20desc" +
+            "&fields=files(id,name,modifiedTime,size)"
+        val json = JSONObject(
+            requireSuccess(request(url, token)).toString(Charsets.UTF_8)
+        )
+        return json.optJSONArray("files") ?: JSONArray()
+    }
+
+    private fun latestBackupModifiedTime(token: String): String? {
+        val files = listBackups(token)
+        if (files.length() == 0) return null
+        return files.getJSONObject(0).optString("modifiedTime").ifBlank { null }
+    }
+
+    suspend fun getLatestBackupModifiedTime(token: String): String? =
+        withContext(Dispatchers.IO) {
+            require(token.isNotBlank()) { "Google authorization is required." }
+            latestBackupModifiedTime(token)
+        }
+
+    suspend fun getConnectedEmail(token: String): String =
+        withContext(Dispatchers.IO) {
+            require(token.isNotBlank()) {
+                "Google authorization is required."
+            }
+            val bytes = requireSuccess(
+                request(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    token
+                )
+            )
+            val email = JSONObject(
+                bytes.toString(Charsets.UTF_8)
+            ).optString("email").trim()
+            require(email.contains("@")) {
+                "Google did not return a valid account email."
+            }
+            email
+        }
+
+    suspend fun backup(
+        context: Context,
+        token: String
+    ): BackupInfo = withContext(Dispatchers.IO) {
+        require(token.isNotBlank()) { "Google authorization is required." }
+
+        val appContext = context.applicationContext
+        val db = NoteDatabase.get(appContext)
+        val prefs = appContext.getSharedPreferences(
+            "note_profile", Context.MODE_PRIVATE
+        )
+        val snapshot = makeSnapshot(db.noteDao().getAll(), prefs)
+        require(snapshot.size <= MAX_BACKUP_BYTES) {
+            "Backup is too large."
+        }
+
+        val existing = listBackups(token)
+        val boundary = "NoteBackupBoundary${System.currentTimeMillis()}"
+        val metadata = JSONObject().apply {
+            put("name", BACKUP_NAME)
+            put("parents", JSONArray().put("appDataFolder"))
+            put("mimeType", "application/json")
+        }.toString().toByteArray(Charsets.UTF_8)
+
+        val prefix = (
+            "--$boundary\r\n" +
+            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val middle = (
+            "\r\n--$boundary\r\n" +
+            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val suffix = "\r\n--$boundary--".toByteArray(Charsets.UTF_8)
+        val multipart = prefix + metadata + middle + snapshot + suffix
+
+        val createUrl = "$UPLOAD_FILES?uploadType=multipart&fields=id"
+        val created = JSONObject(
+            requireSuccess(
+                request(
+                    createUrl, token, "POST", multipart,
+                    "multipart/related; boundary=$boundary"
+                )
+            ).toString(Charsets.UTF_8)
+        )
+        val newId = created.getString("id")
+
+        // Delete older copies only after the replacement upload succeeds.
+        for (i in 0 until existing.length()) {
+            val oldId = existing.getJSONObject(i).optString("id")
+            if (oldId.isNotBlank() && oldId != newId) {
+                val result = request("$DRIVE_FILES/$oldId", token, "DELETE")
+                if (result.first !in 200..299 && result.first != 404) {
+                    error("Backup uploaded, but an older backup could not be cleaned up.")
+                }
+            }
+        }
+
+        BackupInfo(
+            modifiedTime = latestBackupModifiedTime(token),
+            noteCount = db.noteDao().getAll().size
+        )
+    }
+
+    suspend fun restore(
+        context: Context,
+        token: String
+    ): BackupInfo = withContext(Dispatchers.IO) {
+        require(token.isNotBlank()) { "Google authorization is required." }
+
+        val files = listBackups(token)
+        require(files.length() > 0) {
+            "No Note backup was found in this Google account."
+        }
+
+        val file = files.getJSONObject(0)
+        val id = file.getString("id")
+        val bytes = requireSuccess(
+            request("$DRIVE_FILES/$id?alt=media", token)
+        )
+        require(bytes.size <= MAX_BACKUP_BYTES) { "Backup is too large." }
+
+        // Fully parse and validate before changing the local database.
+        val root = JSONObject(bytes.toString(Charsets.UTF_8))
+        require(root.optInt("formatVersion", -1) == 1) {
+            "Unsupported or invalid backup format."
+        }
+        require(root.optString("app") == "Note") {
+            "This backup does not belong to the Note app."
+        }
+        val array = root.getJSONArray("notes")
+        val restoredNotes = ArrayList<Note>(array.length())
+        val ids = HashSet<Long>()
+        for (i in 0 until array.length()) {
+            val note = jsonToNote(array.getJSONObject(i))
+            require(ids.add(note.id)) {
+                "Backup contains duplicate note IDs."
+            }
+            restoredNotes.add(note)
+        }
+
+        val profile = root.getJSONObject("profile")
+        val name = profile.optString("name", "")
+        val mobile = profile.optString("mobile", "")
+
+        val appContext = context.applicationContext
+        val db = NoteDatabase.get(appContext)
+        db.withTransaction {
+            db.noteDao().clearAll()
+            db.noteDao().insertAll(restoredNotes)
+        }
+
+        val prefs = appContext.getSharedPreferences(
+            "note_profile", Context.MODE_PRIVATE
+        )
+        check(
+            prefs.edit()
+                .putString("name", name)
+                .putString("mobile", mobile)
+                .commit()
+        ) { "Notes restored, but profile details could not be saved." }
+
+        BackupInfo(
+            modifiedTime = file.optString("modifiedTime").ifBlank { null },
+            noteCount = restoredNotes.size
+        )
+    }
+}

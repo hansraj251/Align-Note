@@ -10,11 +10,29 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.note.app"
+        applicationId = "in.alignos.note"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        targetSdk = 36
+        versionCode = 3
+        versionName = "1.2"
+    }
+
+
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getenv("NOTE_KEYSTORE_PATH") ?: "${System.getProperty("user.home")}/.android/note-upload.jks")
+            storePassword = System.getenv("NOTE_STORE_PASSWORD")
+            keyAlias = "note-upload"
+            keyPassword = System.getenv("NOTE_KEY_PASSWORD")
+        }
+    }
+
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+        }
     }
 
     buildFeatures {
@@ -32,6 +50,7 @@ android {
 }
 
 dependencies {
+    implementation("com.google.android.gms:play-services-auth:22.0.0")
     implementation(platform("androidx.compose:compose-bom:2025.10.00"))
     implementation("androidx.activity:activity-compose:1.11.0")
     implementation("androidx.compose.ui:ui")
